@@ -1,3 +1,5 @@
 tensorflow == 2.12
 deepface
 scikit-learn
+torch
+pytorch-lightning
