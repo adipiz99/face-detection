@@ -58,10 +58,90 @@ class PairDataset(data.Dataset):
         im2 = torch.tensor(im2, device=device, dtype=torch.float32)
         l2 = self.dataset.iloc[self.paired_idx[i]]['label']
 
-        l = self.pair_labels[i] #coup\le label
+        l = self.pair_labels[i] #couple label
         
         #return the two elements of the pair, their labels and the couple label
         return im1, im2, l, l1, l2
+    
+class LSTMEmbedding(nn.Module):
+    def __init__(self):
+        super(LSTMEmbedding, self).__init__()
+        self.lstm = nn.LSTM(input_size=12, hidden_size=100, num_layers=1, batch_first=True)
+
+        #FC layers
+        self.fc1 = nn.Linear(100, 50)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(50, 10)
+        self.relu2 = nn.ReLU()
+        self.fc3 = nn.Linear(10, 2)
+        self.sftmx = nn.Softmax(dim=0)
+        
+    def forward(self, x):
+        out, _ = self.lstm(x)
+        out = self.fc1(out)
+        out = self.relu1(out)
+        out = self.fc2(out)
+        out = self.relu2(out)
+        out = self.fc3(out)
+        out = self.sftmx(out)
+        return out
+    
+class LCNNEmbedding(nn.Module):
+    def __init__(self):
+        super(LCNNEmbedding, self).__init__()
+
+        #LCNN implementation
+        self.conv1 = nn.Conv1d(12, 32, 3)
+        self.pool = nn.MaxPool1d(2)
+        self.conv2 = nn.Conv1d(32, 64, 3)
+
+        #FC layers
+        self.fc1 = nn.Linear(64*2, 100)
+        self.relu1 = nn.ReLU()
+        self.fc2 = nn.Linear(100, 50)
+        self.relu2 = nn.ReLU()
+        self.fc3 = nn.Linear(50, 2)
+        self.sftmx = nn.Softmax(dim=0)
+        
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.pool(out)
+        out = self.conv2(out)
+        out = self.pool(out)
+        out = out.view(-1, 64*2)
+        out = self.fc1(out)
+        out = self.relu1(out)
+        out = self.fc2(out)
+        out = self.relu2(out)
+        out = self.fc3(out)
+        out = self.sftmx(out)
+        return out
+    
+class AlexNetEmbedding(nn.Module):
+    def __init__(self):
+        super(AlexNetEmbedding, self).__init__()
+        self.alexnet = models.alexnet(weights= models.AlexNet_Weights.IMAGENET1K_V1, pretrained=True)
+        num_classes = 2
+        self.alexnet.classifier[6] = nn.Linear(4096, num_classes)
+        self.sftmx = nn.Softmax(dim=0)
+        
+    def forward(self, x):
+        out = self.alexnet(x)
+        out = self.sftmx(out)
+        return out
+    
+class VGGEmbedding(nn.Module):
+    def __init__(self):
+        super(VGGEmbedding, self).__init__()
+        self.vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1, pretrained=True)
+        num_classes = 2
+        self.vgg.classifier[6] = nn.Linear(4096, num_classes)
+        self.sftmx = nn.Softmax(dim=0)
+        
+    def forward(self, x):
+        out = self.vgg(x)
+        out = self.sftmx(out)
+        return out
     
 class ResNetEmbedding(nn.Module):
     def __init__(self):
