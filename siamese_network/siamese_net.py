@@ -1,3 +1,4 @@
+import cv2
 import torch
 import numpy as np
 import pandas as pd
@@ -11,10 +12,12 @@ from torchvision import *
 from torchvision.transforms import v2
 
 class PairDataset(data.Dataset):
-    def __init__(self, dataframe: pd.DataFrame):
+    def __init__(self, dataframe: pd.DataFrame): #Passing a dataframe in which data is stored under the columns 'image' and 'label'. Image contains the path of the images, label contains the class of the image.
         self.dataset = dataframe
-        self.transforms = v2.Compose([
-            v2.ToDtype(torch.float32, scale=False),
+        self.transforms = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((256, 256)), #resize the image to 256x256
+            transforms.ToTensor()
         ])
         
         self.class_to_indices = {c: dataframe.index[dataframe['label'] == c].tolist() for c in range(2)} # range(x), x = number of different classes 
@@ -50,19 +53,23 @@ class PairDataset(data.Dataset):
     def __getitem__(self, i):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         #the first element of the pair is the i-th element of the dataset
-        df = self.dataset.drop(columns='label').to_numpy() #.reshape(-1, 12, 1, 1) eventually reshape with the right dimensions
-        im1 = df[i]
-        im1 = torch.tensor(im1, device=device, dtype=torch.float32)
-        l1 = self.dataset.iloc[i]['label']
-        im2 = df[self.paired_idx[i]]
-        im2 = torch.tensor(im2, device=device, dtype=torch.float32)
-        l2 = self.dataset.iloc[self.paired_idx[i]]['label']
+        im1 = self.dataset.iloc[i]['image'] #Image path of the first element
+        im1 = cv2.imread(im1) #Read the image
+        im1 = self.transforms(im1).to(device) #Use the transforms to convert the image to a reshaped tensor, according to the size of the input layer
+        l1 = self.dataset.iloc[i]['label'] #Label of the first element 
+
+        #the second element of the pair is the i-th element in the paired_idx vector
+        im2 = self.dataset.iloc[self.paired_idx[i]]['image'] #Image path of the second element
+        im2 = cv2.imread(im2) #Read the image
+        im2 = self.transforms(im2).to(device) #Use the transforms to convert the image to a reshaped tensor, according to the size of the input layer
+        l2 = self.dataset.iloc[self.paired_idx[i]]['label'] #Label of the second element
 
         l = self.pair_labels[i] #couple label
         
         #return the two elements of the pair, their labels and the couple label
         return im1, im2, l, l1, l2
-    
+
+#### Network architectures ####
 class LSTMEmbedding(nn.Module):
     def __init__(self):
         super(LSTMEmbedding, self).__init__()
@@ -165,27 +172,28 @@ class ResNetEmbedding(nn.Module):
         out = self.fc1(out)
         out = self.relu1(out)
         out = self.fc2(out)
-        out = self.relu2(out) #if retrurns all zeroes, dekete this step
+        out = self.relu2(out)
         out = self.fc3(out)
         out = self.sftmx(out)
         return out
 
+#### Loss function ####
 class ContrastiveLoss(torch.nn.Module):
     def __init__(self, m=2):
         super(ContrastiveLoss, self).__init__()
-        self.m = m
+        self.m = m #margin
 
     def forward(self, phi_i, phi_j, l_ij):
-        d = F.pairwise_distance(phi_i, phi_j, keepdim=True)
+        d = F.pairwise_distance(phi_i, phi_j, keepdim=True) #calculates the euclidean distance between the two embeddings
 
         l = 0.5 * (1 - l_ij.float()) * torch.pow(d,2) + \
-            0.5 * l_ij.float() * torch.pow( torch.clamp( self.m - d, min = 0) , 2)
-        return l.mean()
+            0.5 * l_ij.float() * torch.pow( torch.clamp( self.m - d, min = 0) , 2) #contrastive loss function with LeCun's formula
+        return l.mean() #return the mean of the loss
     
 class SiameseNet(nn.Module):
     def __init__(self, embedding_net):
         super(SiameseNet, self).__init__()
-        self.embedding_net = embedding_net
+        self.embedding_net = embedding_net #embedding network
 
     def forward(self, x1, x2):
         output1 = self.embedding_net(x1)
@@ -204,56 +212,53 @@ class SiameseNetworkTask(pl.LightningModule):
                 ):
         super(SiameseNetworkTask, self).__init__()
         self.save_hyperparameters()
-        self.embedding_net = embedding_net
-        self.embedding_net_state_dict = self.embedding_net.state_dict()
-        self.criterion = ContrastiveLoss(margin) #definiamo la loss
-        self.criterion_state_dict = self.criterion.state_dict()
-        self.best_loss = np.inf
-        self.losses = []
-        self.val_losses = []
+        self.embedding_net = embedding_net #Initialize the embedding network
+        self.embedding_net_state_dict = self.embedding_net.state_dict() #Save the state of the embedding network
+        self.criterion = ContrastiveLoss(margin) #Initialize the loss function
+        self.criterion_state_dict = self.criterion.state_dict() #Save the state of the loss function
+        self.best_loss = np.inf #Initialize the best loss
+        self.losses = [] #Initialize the losses array
+        self.val_losses = [] #Initialize the validation losses array
 
                     
     def forward(self, x):
         return self.model(x)
         
     def configure_optimizers(self):
-        return SGD(self.embedding_net.parameters(), self.hparams.lr, momentum=self.hparams.momentum)
+        return SGD(self.embedding_net.parameters(), self.hparams.lr, momentum=self.hparams.momentum) #SGD optimizer
     
     def training_step(self, batch, batch_idx):
-        # preleviamo gli elementi I_i e I_j e l'etichetta l_ij
-        # scartiamo il resto (le etichette dei singoli elementi)
+        # Extract the data from the batch
         I_i, I_j, l_ij, l_i, l_j = batch
         
-        #l'implementazione della rete siamese è banale:
-        #eseguiamo la embedding net sui due input
+        #Execute the forward on the two images
         phi_i = self.embedding_net(I_i)
         phi_j = self.embedding_net(I_j)
 
-        #calcoliamo la loss
+        #Compute the loss
         l = self.criterion(phi_i, phi_j, l_ij)
-        #Convert tensor to double
         l_arr = l.item()
         #l_arr = l.double()
         self.losses.append(l_arr)
         #self.losses.append(l.detach().to('cpu'))
         
 
-        if l < self.best_loss:
+        if l < self.best_loss: #If the loss is the best loss so far, save the model
             self.best_loss = l
             self.save_hyperparameters()
             self.embedding_net_state_dict = self.embedding_net.state_dict()
             self.criterion_state_dict = self.criterion.state_dict()
-            model_name = 'models/SiameseNet.pth'
+            model_name = 'models/SiameseNet.pth' #Save the model in this path
             
             torch.save({
             'embedding_state_dict': self.embedding_net.state_dict(),
             'loss': self.criterion.state_dict,
             'best_loss': self.best_loss,
             'hyperparameters': self.hparams,
-            }, model_name)
+            }, model_name) #Save the model
         
         
-        self.log('train/loss', l, on_step=True)
+        self.log('train/loss', l, on_step=True) #Log the loss to tensorboard
         return l
     
     def validation_step(self, batch, batch_idx):
@@ -266,8 +271,8 @@ class SiameseNetworkTask(pl.LightningModule):
 
         self.log('val/loss', l, on_step=True)
 
-        #if batch_idx==0:
-            #self.logger.experiment.add_embedding(phi_i, batch[3], I_i, global_step=self.global_step)
+        if batch_idx==0:
+            self.logger.experiment.add_embedding(phi_i, batch[3], I_i, global_step=self.global_step) #Add the embeddings to tensorboard for visualization
 
 class Extractor: #Once the model is trained, we can use this class to extract the representations of the data
     def __init__(self, model, loader):
@@ -276,27 +281,25 @@ class Extractor: #Once the model is trained, we can use this class to extract th
 
     def extract_representations_with_labels(self):
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.eval()
-        self.model.to(device)
-        representations, labels = [], []
-        for batch in self.loader:
-            x = batch[0].to(device, dtype=torch.float32)
-            rep = self.model(x)
-            rep = rep.detach().to('cpu').numpy()
-            labels.append(batch[1])
-            representations.append(rep)
-        return np.concatenate(representations), np.concatenate(labels)
+        self.model.eval() #Set the model to evaluation mode
+        self.model.to(device) #Move the model to the device
+        representations, labels = [], [] #Initialize the representations and labels arrays
+        for batch in self.loader: #For each batch in the loader
+            x = batch[0].to(device, dtype=torch.float32) #Move the batch to the device
+            rep = self.model(x) #Get the representation of the batch
+            rep = rep.detach().to('cpu').numpy() #Move the representation to the cpu and convert it to a numpy array
+            labels.append(batch[1]) #Append the labels of the batch
+            representations.append(rep) #Append the representations of the batch
+        return np.concatenate(representations), np.concatenate(labels) #Return the representations and labels
     
     def extract_representations(self):
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.model.eval()
-        self.model.to(device)
-        representations = []
-        for batch in self.loader:
-            x = batch.clone().detach().to(device, dtype=torch.float32)
-            #x = torch.tensor(batch, device=device, dtype=torch.float32)
-            #x = batch.to(device, dtype=torch.float32)
-            rep = self.model(x)
-            rep = rep.detach().to('cpu').numpy()
-            representations.append(rep)
-        return np.concatenate(representations)
+        device = "cuda" if torch.cuda.is_available() else "cpu" 
+        self.model.eval() #Set the model to evaluation mode
+        self.model.to(device) #Move the model to the device
+        representations = [] #Initialize the representations array
+        for batch in self.loader: #For each batch in the loader
+            x = batch.clone().detach().to(device, dtype=torch.float32) #Move the batch to the device
+            rep = self.model(x) #Get the representation of the batch
+            rep = rep.detach().to('cpu').numpy() #Move the representation to the cpu and convert it to a numpy array
+            representations.append(rep) #Append the representations of the batch
+        return np.concatenate(representations) #Return the representations
